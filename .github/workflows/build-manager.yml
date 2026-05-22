@@ -2,22 +2,24 @@ name: Build Manager
 
 on:
   push:
-    branches: [ "stable" ]
+    branches:
+      - stable
+      - beta
+      - canary
     paths:
       - '.github/workflows/build-manager.yml'
       - '.github/workflows/build-lkm.yml'
-      - '.github/workflows/ddk-lkm.yml'
       - '.github/workflows/ksud.yml'
       - 'manager/**'
       - 'kernel/**'
       - 'userspace/**'
   pull_request:
-    branches: [ "stable" ]
+    branches:
+      - stable
+      - beta
+      - canary
     paths:
-      - '.github/workflows/build-manager.yml'
-      - '.github/workflows/build-lkm.yml'
-      - '.github/workflows/ddk-lkm.yml'
-      - '.github/workflows/ksud.yml'
+      - '.github/workflows/**'
       - 'manager/**'
       - 'kernel/**'
       - 'userspace/**'
@@ -71,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        spoofed: [ false, true ]
+        spoofed: [ Normal, Spoofed ]
 
     defaults:
       run:
@@ -84,7 +86,7 @@ jobs:
           fetch-depth: 0
 
       - name: Spoof Package ID
-        if: matrix.spoofed == true
+        if: matrix.spoofed == 'Spoofed'
         run: |
           chmod +x spoof
           ./spoof
@@ -92,7 +94,7 @@ jobs:
       - name: Setup need_upload
         id: need_upload
         run: |
-          if [ ! -z "${{ secrets.BOT_TOKEN }}" ]; then
+          if [ ! -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
             echo "UPLOAD=true" >> $GITHUB_OUTPUT
           else
             echo "UPLOAD=false" >> $GITHUB_OUTPUT
@@ -129,7 +131,7 @@ jobs:
           path: .
 
       - name: Download x86_64 ksud
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v6
         with:
           name: ksud-x86_64-linux-android
           path: .
@@ -146,43 +148,216 @@ jobs:
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v5
-        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/stable' )) || github.ref_type == 'tag' }}
+        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/canary' )) || github.ref_type == 'tag' }}
         with:
-          name: ${{ matrix.spoofed && 'manager-spoofed' || 'manager' }}
+          name: ${{ matrix.spoofed == 'Spoofed' && 'manager-spoofed' || 'manager' }}
           path: manager/app/build/outputs/apk/release/*.apk
 
       - name: Upload mappings
         uses: actions/upload-artifact@v5
-        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/stable' )) || github.ref_type == 'tag' }}
+        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/canary' )) || github.ref_type == 'tag' }}
         with:
-          name: ${{ matrix.spoofed && 'mappings-spoofed' || 'mappings' }}
+          name: ${{ matrix.spoofed == 'Spoofed' && 'mappings-spoofed' || 'mappings' }}
           path: "manager/app/build/outputs/mapping/release/"
 
-      - name: Bot session cache
-        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true'
-        id: bot_session_cache
-        uses: actions/cache@v4
+  upload-manager-telegram:
+    needs: build-manager
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
         with:
-          path: scripts/ksubot.session
-          key: ${{ runner.os }}-bot-session
+          fetch-depth: 0
 
-      - name: Upload to telegram
-        if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true'
+      - name: Download Normal Manager
+        uses: actions/download-artifact@v6
+        with:
+          name: manager
+          path: manager
+
+      - name: Download Spoofed Manager
+        uses: actions/download-artifact@v6
+        with:
+          name: manager-spoofed
+          path: manager-spoofed
+
+      - name: Prepare Telegram Context
         env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          MESSAGE_THREAD_ID: ${{ secrets.MESSAGE_THREAD_ID }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          COMMIT_URL: ${{ github.event.head_commit.url }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          TITLE: ${{ matrix.spoofed && 'Stable Manager Build (Spoofed)' || 'Stable Manager Build (Normal)' }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
         run: |
-          if [ ! -z "${{ secrets.BOT_TOKEN }}" ]; then
-            export VERSION=$(git rev-list --count HEAD)
-            APK=$(find ./app/build/outputs/apk/release -name "*.apk")
-            pip3 install telethon
-            python3 $GITHUB_WORKSPACE/scripts/ksunextbot.py $APK
+          set -eu
+
+          escape_html() {
+            local s="$1"
+            s="${s//&/&amp;}"
+            s="${s//</&lt;}"
+            s="${s//>/&gt;}"
+            printf '%s' "$s"
+          }
+
+          COMMIT_MESSAGE_ESCAPED="$(escape_html "${COMMIT_MESSAGE}")"
+
+          # Determine comparison target based on branch
+          TARGET_BRANCH_NAME=""
+          CHANGELOG_HEADER=""
+          PREV_REF=""
+          
+          if [[ "${BRANCH}" == "canary" ]]; then
+            TARGET_BRANCH_NAME="beta"
+            CHANGELOG_HEADER="New Commits since Beta:"
+          elif [[ "${BRANCH}" == "beta" ]]; then
+            TARGET_BRANCH_NAME="stable"
+            CHANGELOG_HEADER="New Commits since Stable:"
+          elif [[ "${BRANCH}" == "stable" ]]; then
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+            if [ -n "$LAST_TAG" ]; then
+              PREV_REF="$LAST_TAG"
+              CHANGELOG_HEADER="New Commits since $LAST_TAG:"
+            fi
           fi
+          
+          CHANGELOG_SECTION=""
+          
+          # If we have a target branch to compare against
+          if [ -n "$TARGET_BRANCH_NAME" ]; then
+             echo "Fetching origin/$TARGET_BRANCH_NAME..."
+             if git fetch origin "$TARGET_BRANCH_NAME"; then
+                PREV_REF="FETCH_HEAD"
+             else
+                echo "Fetch failed."
+             fi
+          fi
+
+          if [ -n "$PREV_REF" ]; then
+             if git rev-parse --verify "$PREV_REF" >/dev/null 2>&1; then
+                COUNT=$(git rev-list --count "$PREV_REF..HEAD")
+                echo "Commit count: $COUNT"
+                if [ "$COUNT" -gt 0 ]; then
+                   LOGS=$(git log --oneline --format="- %s (%h)" "$PREV_REF..HEAD" | head -n 15)
+                   LOGS_ESCAPED="$(escape_html "$LOGS")"
+                   CHANGELOG_SECTION=$(printf '\n\n<b>%s (%s)</b>\n<pre><code>%s</code></pre>' "$CHANGELOG_HEADER" "$COUNT" "$LOGS_ESCAPED")
+                fi
+             fi
+          fi
+
+          MESSAGE=$(
+            printf '%s\n%s\n%s\n%s\n\n%s\n%s\n' \
+            "<b>Repository:</b> <a href=\"https://github.com/${REPO}\">${REPO}</a>" \
+            "<b>Branch:</b> <a href=\"https://github.com/${REPO}/tree/${BRANCH}\">${BRANCH}</a>" \
+            "<b>Commit:</b> <a href=\"https://github.com/${REPO}/commit/${COMMIT_SHA}\">${COMMIT_SHA:0:7}</a>" \
+            "<b>Workflow:</b> <a href=\"https://github.com/${REPO}/actions/runs/${RUN_ID}\">View Run</a>" \
+            "<b>Commit Message:</b>" \
+            "<pre><code>${COMMIT_MESSAGE_ESCAPED}</code></pre>"
+          )
+          
+          FULL_MESSAGE=$(printf '%s%s' "$MESSAGE" "$CHANGELOG_SECTION")
+
+          {
+            echo "TELEGRAM_CAPTION<<EOF"
+            echo "$MESSAGE"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "TELEGRAM_CHANGELOG_MSG<<EOF"
+            echo "$FULL_MESSAGE"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+          
+          if [ -n "$CHANGELOG_SECTION" ]; then
+            echo "SHOULD_SEND_CHANGELOG=true" >> "$GITHUB_ENV"
+          else
+            echo "SHOULD_SEND_CHANGELOG=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Send Changelog to Channel
+        if: (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/beta') && env.SHOULD_SEND_CHANGELOG == 'true'
+        uses: xireiki/channel-post@v1
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_WILD_KSU_CI }}
+          context: ${{ env.TELEGRAM_CHANGELOG_MSG }}
+          parse_mode: HTML
+          method: sendMessage
+
+      - name: Post APKs to Channel
+        if: github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/beta'
+        uses: xireiki/channel-post@v1
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_WILD_KSU_CI }}
+          context: ${{ env.TELEGRAM_CAPTION }}
+          parse_mode: HTML
+          path: "**/*.apk"
+          method: sendFile
+
+      - name: Send Changelog to DM
+        if: env.SHOULD_SEND_CHANGELOG == 'true'
+        uses: xireiki/channel-post@v1
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_USER_ID }}
+          context: ${{ env.TELEGRAM_CHANGELOG_MSG }}
+          parse_mode: HTML
+          method: sendMessage
+
+      - name: Post APKs to DM
+        uses: xireiki/channel-post@v1
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_USER_ID }}
+          context: ${{ env.TELEGRAM_CAPTION }}
+          parse_mode: HTML
+          path: "**/*.apk"
+          method: sendFile
+
+      - name: Prepare Failure Context
+        if: always() && needs.build-manager.result == 'failure'
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+
+          escape_html() {
+            local s="$1"
+            s="${s//&/&amp;}"
+            s="${s//</&lt;}"
+            s="${s//>/&gt;}"
+            printf '%s' "$s"
+          }
+
+          COMMIT_MESSAGE_ESCAPED="$(escape_html "${COMMIT_MESSAGE}")"
+
+          MESSAGE=$(
+            printf '%s\n\n%s\n%s\n%s\n%s\n\n%s\n%s\n' \
+            "<b>Wild KSU Build Failed</b> 🔴" \
+            "<b>Repository:</b> <a href=\"https://github.com/${REPO}\">${REPO}</a>" \
+            "<b>Branch:</b> <a href=\"https://github.com/${REPO}/tree/${BRANCH}\">${BRANCH}</a>" \
+            "<b>Commit:</b> <a href=\"https://github.com/${REPO}/commit/${COMMIT_SHA}\">${COMMIT_SHA:0:7}</a>" \
+            "<b>Workflow:</b> <a href=\"https://github.com/${REPO}/actions/runs/${RUN_ID}\">View Run</a>" \
+            "<b>Commit Message:</b>" \
+            "<pre><code>${COMMIT_MESSAGE_ESCAPED}</code></pre>"
+          )
+          {
+            echo "FAILURE_MESSAGE<<EOF"
+            echo "$MESSAGE"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: DM Failure Notification
+        if: always() && needs.build-manager.result == 'failure'
+        uses: xireiki/channel-post@v1
+        with:
+          bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat_id: ${{ secrets.TELEGRAM_USER_ID }}
+          context: ${{ env.FAILURE_MESSAGE }}
+          parse_mode: HTML
+          method: sendMessage
