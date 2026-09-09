@@ -45,5 +45,13 @@
 			"zygisk floating overlay menu",
 			"zygisk_floating_menu"
 		]
+	},
+	{
+		"reason": "[HIGH RISK] AI-generated code - Possible bootloop - Break other modules - Possible data corruption",
+		"patterns": [
+			"zeromount",
+			"meta-zeromount",
+			"enginex0"
+		]
 	}
 ]
